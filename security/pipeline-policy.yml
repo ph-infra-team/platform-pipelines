@@ -1,0 +1,28 @@
+############################################
+# Pipeline Governance Policy Check
+# Repo: infra_team/platform-pipelines
+# File: security/pipeline-policy.yml
+#
+# Purpose:
+# - Validate .gitlab-ci.yml follows enterprise standards
+# - Ensures required includes, stages, and jobs exist
+# - Prevents developers from bypassing shared pipelines
+############################################
+
+pipeline-policy-check:
+  stage: security
+  extends: .security_defaults
+  script:
+    - conftest --version
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-policies.git
+    - |
+      POLICY_PATH="${PIPELINE_POLICY_PATH:-platform-policies/pipeline/live}"
+
+      if [ ! -d "$POLICY_PATH" ]; then
+        echo "ERROR: Pipeline policy path not found: $POLICY_PATH"
+        exit 1
+      fi
+
+      conftest test .gitlab-ci.yml \
+        --policy "$POLICY_PATH" \
+        --all-namespaces

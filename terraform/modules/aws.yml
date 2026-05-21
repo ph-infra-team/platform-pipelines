@@ -1,0 +1,326 @@
+############################################
+# Shared Terraform AWS Module Pipeline Library
+# Repo: infra_team/platform-pipelines
+# File: terraform/modules/aws.yml
+#
+# Purpose:
+# - Single include wrapper for AWS Terraform module repos
+# - Validates reusable Terraform modules before teams consume them
+# - Enforces module structure, source governance, Checkov, TFLint
+# - Runs Terraform plan against an example folder
+# - Runs enterprise OPA/Rego plan policies against tfplan.json
+#
+# Important:
+# - Module repos do NOT apply infrastructure by default
+# - Module repos are validated/certified before live repos consume them
+############################################
+
+include:
+  - project: infra_team/platform-pipelines
+    ref: main
+    file: security/common-security.yml
+  - project: infra_team/platform-pipelines
+    ref: main
+    file: security/pipeline-policy.yml
+
+stages:
+  - security
+  - governance
+  - compliance
+  - lint
+  - fmt
+  - validate
+  - plan
+  - policy
+  - release
+
+variables:
+  PIPELINE_POLICY_PATH: "platform-policies/pipeline/modules"
+  TERRAFORM_MODULE_SOURCE_POLICY_PATH: "platform-policies/terraform/modules/source"
+  TERRAFORM_PLAN_POLICY_PATH: "platform-policies/terraform/plan"
+
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"
+  AWS_ACCESS_KEY_ID: "mock"
+  AWS_SECRET_ACCESS_KEY: "mock"
+  AWS_DEFAULT_REGION: "us-east-1"
+  AWS_REGION: "us-east-1"
+  AWS_EC2_METADATA_DISABLED: "true"
+  TF_VAR_kms_key_arn: "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000"
+
+  # Default example used to test module plan behavior.
+  # A module repo should have examples/basic/main.tf.
+  MODULE_EXAMPLE_DIR: "examples/basic"
+
+############################################
+# Global Terraform Defaults
+############################################
+.terraform_module_defaults:
+  image: registry.midhtech.local:5050/infra_team/platform-images/terraform-aws:latest
+  tags:
+    - platform
+
+############################################
+# Security Tool Defaults
+#
+# Needed because conftest jobs use the security image.
+# common-security.yml already defines .security_defaults,
+# but keeping terraform module defaults separate avoids mixing images.
+############################################
+
+############################################
+# Terraform Module Init
+#
+# Purpose:
+# - Initializes Terraform inside the selected module example folder
+# - Uses local/example configuration only
+# - Does NOT configure GitLab HTTP backend by default
+#
+# Reason:
+# - Module repos should not manage long-lived production state
+# - Example plan is used only to validate module behavior
+############################################
+.terraform_module_init:
+  extends:
+    - .terraform_module_defaults
+  before_script:
+    - terraform --version
+    - aws --version
+    - |
+      if [ ! -d "$MODULE_EXAMPLE_DIR" ]; then
+        echo "ERROR: Module example directory not found: $MODULE_EXAMPLE_DIR"
+        echo "Create an example such as examples/basic/main.tf to test this module."
+        exit 1
+      fi
+
+    - cd "$MODULE_EXAMPLE_DIR"
+    - |
+      cat > ci_provider_override.tf <<'EOF'
+      provider "aws" {
+        region                      = "us-east-1"
+        access_key                  = "mock"
+        secret_key                  = "mock"
+        skip_credentials_validation = true
+        skip_metadata_api_check     = true
+        skip_requesting_account_id  = true
+      }
+      EOF
+    - terraform init -input=false
+
+############################################
+# Terraform fmt
+#
+# Purpose:
+# - Enforces Terraform formatting across the whole module repo
+############################################
+module-fmt:
+  stage: fmt
+  extends: .terraform_module_defaults
+  script:
+    - terraform fmt -check -recursive
+
+############################################
+# Terraform validate
+#
+# Purpose:
+# - Validates the example configuration that consumes the module
+# - Ensures the module can be initialized and parsed correctly
+############################################
+module-validate:
+  stage: validate
+  extends: .terraform_module_init
+  script:
+    - terraform validate
+
+############################################
+# Module Source Policy Check
+#
+# Purpose:
+# - Validates module source code before planning
+# - Enforces module authoring standards
+#
+# Examples:
+# - no provider block inside reusable module
+# - no backend block inside reusable module
+# - required README
+# - required examples
+# - required variables/outputs
+# - no hardcoded ARNs/account IDs
+############################################
+module-source-policy-check:
+  stage: governance
+  extends: .security_defaults
+  allow_failure: false
+  script:
+    - conftest --version
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-policies.git
+    - |
+      echo "Running Terraform module repository structure checks..."
+
+      test -f README.md || { echo "ERROR: README.md is required for Terraform modules."; exit 1; }
+      test -f variables.tf || { echo "ERROR: variables.tf is required for Terraform modules."; exit 1; }
+      test -f outputs.tf || { echo "ERROR: outputs.tf is required for Terraform modules."; exit 1; }
+      test -d examples/basic || { echo "ERROR: examples/basic directory is required for Terraform modules."; exit 1; }
+      test -f examples/basic/main.tf || { echo "ERROR: examples/basic/main.tf is required for Terraform modules."; exit 1; }
+
+      echo "Repository structure checks passed."
+
+      TF_FILES=$(find . -type f -name "*.tf" \
+        -not -path "./.terraform/*" \
+        -not -path "./platform-policies/*" \
+        -not -path "./.git/*")
+
+      if [ -z "$TF_FILES" ]; then
+        echo "ERROR: No Terraform files found in module repo."
+        exit 1
+      fi
+
+      if [ ! -d "$TERRAFORM_MODULE_SOURCE_POLICY_PATH" ]; then
+        echo "ERROR: Terraform module source policy path not found: $TERRAFORM_MODULE_SOURCE_POLICY_PATH"
+        exit 1
+      fi
+
+      echo "Running Terraform module source OPA policies..."
+
+      conftest test $TF_FILES \
+        --policy "$TERRAFORM_MODULE_SOURCE_POLICY_PATH" \
+        --all-namespaces
+
+############################################
+# Terraform Module Plan
+#
+# Purpose:
+# - Creates a Terraform plan from examples/basic
+# - Generates tfplan.json artifact for OPA/Rego validation
+#
+# Important:
+# - This validates what the module would create
+# - It does not apply infrastructure
+############################################
+module-plan:
+  stage: plan
+  extends: .terraform_module_init
+  script:
+    - terraform plan -input=false -out=tfplan
+    - terraform show -json tfplan > tfplan.json
+  artifacts:
+    name: "module-tfplan-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - ${MODULE_EXAMPLE_DIR}/tfplan
+      - ${MODULE_EXAMPLE_DIR}/tfplan.json
+    expire_in: 7 days
+
+############################################
+# Module Plan Policy Check
+#
+# Purpose:
+# - Validates module example tfplan.json against enterprise plan policies
+# - Reuses the same Terraform plan policy catalog used by live repos
+#
+# Examples:
+# - required tags
+# - encryption
+# - public access
+# - IAM least privilege
+# - logging
+# - backup
+############################################
+module-plan-policy-check:
+  stage: policy
+  extends: .security_defaults
+  needs:
+    - job: module-plan
+      artifacts: true
+  script:
+    - conftest --version
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-policies.git
+    - |
+      TFPLAN_JSON="$MODULE_EXAMPLE_DIR/tfplan.json"
+
+      if [ ! -f "$TFPLAN_JSON" ]; then
+        echo "ERROR: tfplan.json not found at $TFPLAN_JSON"
+        exit 1
+      fi
+
+      if [ ! -d "$TERRAFORM_PLAN_POLICY_PATH" ]; then
+        echo "ERROR: Terraform plan policy path not found: $TERRAFORM_PLAN_POLICY_PATH"
+        exit 1
+      fi
+
+      conftest test "$TFPLAN_JSON" \
+        --policy "$TERRAFORM_PLAN_POLICY_PATH" \
+        --all-namespaces
+
+############################################
+# Publish Terraform Module
+#
+# Purpose:
+# - Publishes validated Terraform modules to GitLab Terraform Module Registry
+# - Runs only on semantic version tags, for example v1.0.0
+# - Uses CI_JOB_TOKEN for registry authentication
+# - Uses enterprise-managed Terraform AWS image
+############################################
+publish-module:
+  stage: release
+  extends: .terraform_module_defaults
+  needs:
+    - job: module-source-policy-check
+      artifacts: false
+    - job: module-plan-policy-check
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: never
+  variables:
+    TERRAFORM_MODULE_DIR: "${CI_PROJECT_DIR}"
+    TERRAFORM_MODULE_SYSTEM: "aws"
+    TERRAFORM_MODULE_VERSION: "${CI_COMMIT_TAG}"
+  script:
+    - |
+      command -v curl >/dev/null 2>&1 || {
+        echo "ERROR: curl is required in terraform-aws platform image."
+        exit 1
+      }
+
+      command -v tar >/dev/null 2>&1 || {
+        echo "ERROR: tar is required in terraform-aws platform image."
+        exit 1
+      }
+
+      MODULE_VERSION="${TERRAFORM_MODULE_VERSION#v}"
+      MODULE_NAME="${CI_PROJECT_NAME}"
+
+      MODULE_NAME="$(echo "$MODULE_NAME" | sed 's/^tf-aws-//' | tr ' _' '-' | tr '[:upper:]' '[:lower:]')"
+
+      if [ -z "$MODULE_NAME" ]; then
+        echo "ERROR: Module name could not be resolved."
+        exit 1
+      fi
+
+      if [ -z "$MODULE_VERSION" ]; then
+        echo "ERROR: Module version could not be resolved."
+        exit 1
+      fi
+
+      PACKAGE_FILE="/tmp/${MODULE_NAME}-${TERRAFORM_MODULE_SYSTEM}-${MODULE_VERSION}.tgz"
+
+      echo "Publishing Terraform module:"
+      echo "  name: ${MODULE_NAME}"
+      echo "  system: ${TERRAFORM_MODULE_SYSTEM}"
+      echo "  version: ${MODULE_VERSION}"
+
+      tar -czf "$PACKAGE_FILE" \
+        -C "${TERRAFORM_MODULE_DIR}" \
+        --exclude=".git" \
+        --exclude=".terraform" \
+        --exclude="**/.terraform" \
+        --exclude="tfplan" \
+        --exclude="tfplan.json" \
+        --exclude=".terraform.lock.hcl" \
+        .
+
+      curl --fail-with-body \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file "$PACKAGE_FILE" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/terraform/modules/${MODULE_NAME}/${TERRAFORM_MODULE_SYSTEM}/${MODULE_VERSION}/file"

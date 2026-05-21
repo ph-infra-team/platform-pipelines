@@ -1,0 +1,394 @@
+############################################
+# Shared AWX App Automation Pipeline
+# Repo: infra_team/platform-pipelines
+# File: ansible/awx-app.yml
+#
+# Purpose:
+# - Allows app automation repos to request AWX resources by variables only
+# - Launches a trusted central AWX config-as-code job template
+# - Syncs the app AWX project after resource creation
+# - Launches the app job template and streams AWX output into GitLab logs
+# - Provides a guarded manual cleanup path
+############################################
+
+stages:
+  - validate
+  - configure
+  - sync
+  - launch
+  - cleanup
+
+variables:
+  AWX_HOST: "http://awx.midhtech.local"
+  AWX_CONFIG_VARS_FILE: "awx/team_vars.yml"
+  AWX_CONFIGURE_JOB_TEMPLATE: "central-awx-configure-resources"
+  AWX_CLEANUP_JOB_TEMPLATE: "central-awx-cleanup-resources"
+  AWX_APP_PROJECT_NAME: ""
+  AWX_APP_JOB_TEMPLATE: ""
+  AWX_APP_BRANCH: "$CI_COMMIT_REF_NAME"
+
+.awx_app_defaults:
+  image: registry.midhtech.local:5050/infra_team/platform-images/ansible-awx:latest
+  tags:
+    - platform
+
+############################################
+# Validate AWX App Declaration
+#
+# Enterprise purpose:
+# - Fails fast before AWX is changed
+# - Ensures app repos provide only approved declarative input
+# - Keeps trusted setup logic out of app repositories
+############################################
+awx-validate:
+  stage: validate
+  extends: .awx_app_defaults
+  script:
+    - |
+      set -e
+
+      if [ ! -f "$AWX_CONFIG_VARS_FILE" ]; then
+        echo "ERROR: $AWX_CONFIG_VARS_FILE is required."
+        exit 1
+      fi
+
+      python3 - <<'PY'
+      import os
+      import sys
+      from pathlib import Path
+      import yaml
+
+      path = Path(os.environ["AWX_CONFIG_VARS_FILE"])
+      data = yaml.safe_load(path.read_text()) or {}
+
+      required_top_level = ["awx_app_name", "controller_projects_all", "controller_job_templates_all"]
+      missing = [key for key in required_top_level if key not in data]
+      if missing:
+          print(f"ERROR: missing required keys in {path}: {', '.join(missing)}")
+          sys.exit(1)
+
+      if not data["controller_projects_all"]:
+          print("ERROR: controller_projects_all must define at least one AWX project.")
+          sys.exit(1)
+
+      if not data["controller_job_templates_all"]:
+          print("ERROR: controller_job_templates_all must define at least one AWX job template.")
+          sys.exit(1)
+
+      print(f"Validated AWX app declaration: {path}")
+      PY
+
+############################################
+# Configure AWX Resources
+#
+# Enterprise purpose:
+# - Calls the trusted central AWX config job template
+# - Passes app repo variables as extra_vars
+# - Serializes changes per app/environment to avoid concurrent drift
+############################################
+awx-configure:
+  stage: configure
+  extends: .awx_app_defaults
+  needs:
+    - awx-validate
+  resource_group: "awx-config-${CI_PROJECT_PATH_SLUG}-${CI_COMMIT_REF_SLUG}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      set -e
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      EXTRA_VARS=$(python3 - <<'PY'
+      import json
+      import os
+      from pathlib import Path
+      import yaml
+
+      path = Path(os.environ["AWX_CONFIG_VARS_FILE"])
+      data = yaml.safe_load(path.read_text()) or {}
+      data["awx_owner_repo"] = os.environ["CI_PROJECT_PATH"]
+      data["awx_owner_commit"] = os.environ["CI_COMMIT_SHA"]
+      data["awx_owner_branch"] = os.environ["CI_COMMIT_REF_NAME"]
+
+      optional_env_map = {
+          "AWX_SCM_CREDENTIAL_NAME": "awx_scm_credential_name",
+          "AWX_AWS_CREDENTIAL_NAME": "awx_aws_credential_name",
+          "AWX_BASE_AWS_CREDENTIAL_NAME": "awx_base_aws_credential_name",
+          "AWX_SSM_BUCKET_NAME": "awx_ssm_bucket_name",
+          "AWX_SSM_BUCKET_KMS_KEY_ID": "awx_ssm_bucket_kms_key_id",
+          "AWS_ASSUME_ROLE_ARN": "aws_assume_role_arn",
+          "AWS_DEFAULT_REGION": "aws_region",
+      }
+
+      for env_name, var_name in optional_env_map.items():
+          value = os.environ.get(env_name)
+          if value:
+              data[var_name] = value
+
+      replacements = {
+          "{{ awx_scm_credential_name }}": data.get("awx_scm_credential_name"),
+          "{{ awx_aws_credential_name }}": data.get("awx_aws_credential_name"),
+          "{{ awx_base_aws_credential_name }}": data.get("awx_base_aws_credential_name"),
+          "{{ aws_assume_role_arn }}": data.get("aws_assume_role_arn"),
+          "{{ aws_region }}": data.get("aws_region"),
+          "{{ aws_assume_role_profile }}": data.get("aws_assume_role_profile"),
+      }
+
+      def resolve_placeholders(value):
+          if isinstance(value, str):
+              replacement = replacements.get(value)
+              return replacement if replacement else value
+          if isinstance(value, list):
+              return [resolve_placeholders(item) for item in value]
+          if isinstance(value, dict):
+              return {key: resolve_placeholders(item) for key, item in value.items()}
+          return value
+
+      data = resolve_placeholders(data)
+
+      def find_unresolved_placeholders(value, path="$"):
+          findings = []
+          if isinstance(value, str) and "{{" in value and "}}" in value:
+              findings.append(f"{path}={value}")
+          elif isinstance(value, list):
+              for index, item in enumerate(value):
+                  findings.extend(find_unresolved_placeholders(item, f"{path}[{index}]"))
+          elif isinstance(value, dict):
+              for key, item in value.items():
+                  findings.extend(find_unresolved_placeholders(item, f"{path}.{key}"))
+          return findings
+
+      unresolved = find_unresolved_placeholders(data)
+      if unresolved:
+          raise SystemExit(
+              "ERROR: unresolved placeholders remain in AWX config variables: "
+              + "; ".join(unresolved)
+          )
+
+      scm_credential = data.get("awx_scm_credential_name")
+      legacy_aws_credential = data.get("awx_aws_credential_name")
+      base_aws_credential = data.get("awx_base_aws_credential_name")
+
+      for project in data.get("controller_projects_all", []):
+          if project.get("credential") == "{{ awx_scm_credential_name }}":
+              if scm_credential:
+                  project["credential"] = scm_credential
+              else:
+                  project.pop("credential", None)
+
+      for template in data.get("controller_job_templates_all", []):
+          resolved_credentials = []
+          for credential in template.get("credentials", []):
+              if credential == "{{ awx_aws_credential_name }}":
+                  if not legacy_aws_credential:
+                      raise SystemExit(
+                          "ERROR: AWX_AWS_CREDENTIAL_NAME is required because "
+                          "awx/team_vars.yml references {{ awx_aws_credential_name }}."
+                      )
+                  resolved_credentials.append(legacy_aws_credential)
+              elif credential == "{{ awx_base_aws_credential_name }}":
+                  if not base_aws_credential:
+                      raise SystemExit(
+                          "ERROR: AWX_BASE_AWS_CREDENTIAL_NAME is required because "
+                          "awx/team_vars.yml references {{ awx_base_aws_credential_name }}."
+                      )
+                  resolved_credentials.append(base_aws_credential)
+              else:
+                  resolved_credentials.append(credential)
+
+          if "credentials" in template:
+              template["credentials"] = resolved_credentials
+
+      if "aws_assume_role_arn" in data and not data["aws_assume_role_arn"]:
+          raise SystemExit("ERROR: AWS_ASSUME_ROLE_ARN must not be empty when declared.")
+
+      print(json.dumps(data))
+      PY
+      )
+
+      awx_cmd job_templates launch "$AWX_CONFIGURE_JOB_TEMPLATE" \
+        --extra_vars "$EXTRA_VARS" \
+        --monitor
+
+############################################
+# Sync AWX Project
+#
+# Enterprise purpose:
+# - Ensures AWX checks out the just-merged app repository content
+# - Waits for project sync before launching the app job template
+############################################
+awx-sync-project:
+  stage: sync
+  extends: .awx_app_defaults
+  needs:
+    - awx-configure
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ -z "$AWX_APP_PROJECT_NAME" ]; then
+        echo "ERROR: AWX_APP_PROJECT_NAME is required."
+        exit 1
+      fi
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      PROJECT_ID=$(awx_cmd projects list \
+        --name "$AWX_APP_PROJECT_NAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$PROJECT_ID" ]; then
+        echo "ERROR: AWX project not found: $AWX_APP_PROJECT_NAME"
+        exit 1
+      fi
+
+      awx_cmd projects update "$PROJECT_ID" --monitor
+
+############################################
+# Launch AWX Job Template
+#
+# Enterprise purpose:
+# - Runs the app automation from AWX after resources are configured and synced
+# - Streams AWX job output into GitLab pipeline logs for developer feedback
+############################################
+awx-launch-job:
+  stage: launch
+  extends: .awx_app_defaults
+  needs:
+    - awx-sync-project
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ -z "$AWX_APP_JOB_TEMPLATE" ]; then
+        echo "ERROR: AWX_APP_JOB_TEMPLATE is required."
+        exit 1
+      fi
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      EXTRA_VARS=$(python3 - <<'PY'
+      import json
+      import os
+      import yaml
+
+      data = {
+          "gitlab_project": os.environ["CI_PROJECT_PATH"],
+          "gitlab_commit": os.environ["CI_COMMIT_SHA"],
+          "gitlab_branch": os.environ["CI_COMMIT_REF_NAME"],
+      }
+
+      vars_file = os.environ.get("AWX_CONFIG_VARS_FILE", "awx/team_vars.yml")
+      if os.path.exists(vars_file):
+          with open(vars_file, "r", encoding="utf-8") as handle:
+              app_vars = yaml.safe_load(handle) or {}
+          for key in ("aws_assume_role_profile", "aws_region"):
+              if app_vars.get(key):
+                  data[key] = app_vars[key]
+
+      ssm_bucket = os.environ.get("AWX_SSM_BUCKET_NAME")
+      if ssm_bucket:
+          data["awx_ssm_bucket_name"] = ssm_bucket
+
+      ssm_bucket_kms_key_id = os.environ.get("AWX_SSM_BUCKET_KMS_KEY_ID")
+      if ssm_bucket_kms_key_id:
+          data["awx_ssm_bucket_kms_key_id"] = ssm_bucket_kms_key_id
+
+      print(json.dumps(data))
+      PY
+      )
+
+      awx_cmd job_templates launch "$AWX_APP_JOB_TEMPLATE" \
+        --extra_vars "$EXTRA_VARS" \
+        --monitor
+
+############################################
+# Cleanup AWX Resources
+#
+# Enterprise purpose:
+# - Manual break-glass cleanup for AWX resources declared by this app repo
+# - Requires a change ticket and explicit enable flag
+# - Does not delete AWS infrastructure or Terraform-managed hosts
+############################################
+awx-cleanup:
+  stage: cleanup
+  extends: .awx_app_defaults
+  resource_group: "awx-config-${CI_PROJECT_PATH_SLUG}-${CI_COMMIT_REF_SLUG}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ "$AWX_CLEANUP_ENABLED" != "true" ]; then
+        echo "ERROR: AWX_CLEANUP_ENABLED must be true."
+        exit 1
+      fi
+
+      if [ -z "$CHANGE_TICKET_ID" ]; then
+        echo "ERROR: CHANGE_TICKET_ID is required."
+        exit 1
+      fi
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      EXTRA_VARS=$(python3 - <<'PY'
+      import json
+      import os
+      from pathlib import Path
+      import yaml
+
+      path = Path(os.environ["AWX_CONFIG_VARS_FILE"])
+      data = yaml.safe_load(path.read_text()) or {}
+      data["awx_cleanup_enabled"] = True
+      data["change_ticket_id"] = os.environ["CHANGE_TICKET_ID"]
+      data["awx_owner_repo"] = os.environ["CI_PROJECT_PATH"]
+      print(json.dumps(data))
+      PY
+      )
+
+      awx_cmd job_templates launch "$AWX_CLEANUP_JOB_TEMPLATE" \
+        --extra_vars "$EXTRA_VARS" \
+        --monitor

@@ -1,0 +1,282 @@
+############################################
+# Platform Pipelines CI Validation
+# Repo: infra_team/platform-pipelines
+#
+# Purpose:
+# - Validate enterprise shared pipeline templates
+# - Enforce YAML formatting standards
+# - Validate GitLab CI syntax before teams consume templates
+# - Prevent broken shared pipelines from impacting all repos
+#
+# Enterprise Design:
+# - yaml-lint:
+#     Validates YAML formatting/style consistency
+#
+# - gitlab-ci-lint-templates:
+#     Uses GitLab CI Lint API to validate actual pipeline syntax
+#     exactly how GitLab would evaluate the template
+############################################
+
+############################################
+# Pipeline Stages
+#
+# lint:
+# - Static YAML formatting validation
+#
+# validate:
+# - GitLab CI semantic/syntax validation
+############################################
+stages:
+  - lint
+  - validate
+
+############################################
+# Default Runner Configuration
+#
+# Purpose:
+# - Ensures all jobs run on enterprise-approved runners
+############################################
+default:
+  tags:
+    - platform
+
+############################################
+# YAML Lint Validation
+#
+# Purpose:
+# - Enforce YAML formatting standards
+# - Catch indentation issues
+# - Catch malformed YAML before GitLab parsing
+#
+# Important:
+# - Explicit file list is used intentionally
+# - Avoids scanning:
+#     .git/
+#     temporary files
+#     cache directories
+#     generated YAML
+#
+# Enterprise Pattern:
+# - Only governed/shared pipeline files are linted
+############################################
+yaml-lint:
+  stage: lint
+  image: python:3.11-slim
+
+  script:
+    ########################################
+    # Install yamllint dynamically
+    #
+    # --no-cache-dir:
+    # - reduces container layer/cache size
+    ########################################
+    - pip install --no-cache-dir yamllint
+
+    ########################################
+    # Validate governed YAML files only
+    #
+    # Purpose:
+    # - enforce consistent YAML standards
+    # - avoid linting irrelevant/generated files
+    ########################################
+    - |
+      yamllint -c .yamllint.yml \
+        .gitlab-ci.yml \
+        .yamllint.yml \
+        ansible/awx.yml \
+        security/common-security.yml \
+        security/pipeline-policy.yml \
+        terraform/live/aws.yml \
+        terraform/live/terragrunt.yml \
+        terraform/modules/aws.yml \
+        terraform/modules/terragrunt.yml
+
+############################################
+# GitLab CI Template Validation
+#
+# Purpose:
+# - Validates GitLab CI syntax using GitLab CI Lint API
+# - Simulates how GitLab evaluates templates
+# - Detects:
+#     invalid syntax
+#     invalid extends/include usage
+#     invalid stages
+#     invalid job structures
+#
+# Enterprise Importance:
+# - Shared pipeline failures can break ALL consuming repos
+# - This job protects the platform before rollout
+############################################
+gitlab-ci-lint-templates:
+  stage: validate
+  image: python:3.11-slim
+
+  script:
+    - |
+      python3 - <<'PY'
+
+      ######################################
+      # Python Standard Library Imports
+      #
+      # json:
+      # - build API payloads
+      #
+      # os:
+      # - access CI environment variables
+      #
+      # urllib:
+      # - call GitLab API without installing curl
+      #
+      # Enterprise Benefit:
+      # - fewer runtime dependencies
+      # - smaller attack surface
+      # - faster pipelines
+      ######################################
+      import json
+      import os
+      import urllib.request
+      import urllib.error
+
+      ######################################
+      # Validate Required Environment Variables
+      #
+      # CI_API_V4_URL:
+      # - GitLab API base URL
+      #
+      # CI_PROJECT_ID:
+      # - current project ID
+      #
+      # GITLAB_TOKEN:
+      # - token used to call GitLab Lint API
+      #
+      # Enterprise Reason:
+      # - fail fast with clear error messaging
+      ######################################
+      required_env = ["CI_API_V4_URL", "CI_PROJECT_ID", "GITLAB_TOKEN"]
+
+      missing = [
+          name for name in required_env
+          if not os.environ.get(name)
+      ]
+
+      if missing:
+          raise SystemExit(
+              f"ERROR: Missing required CI variables: {', '.join(missing)}"
+          )
+
+      ######################################
+      # Shared Pipeline Entrypoints
+      #
+      # Important:
+      # - Only validate top-level consumable templates
+      # - Fragment files are validated indirectly
+      #
+      # Example:
+      # terraform/modules/aws.yml includes:
+      #   security/common-security.yml
+      #   security/pipeline-policy.yml
+      #
+      # Since empty not including  terraform/live/terragrunt.yml terraform/modules/terragrunt.yml
+      # So validating wrapper templates is enough.
+      ######################################
+      files = [
+          "terraform/live/aws.yml",
+          "terraform/modules/aws.yml",
+      ]
+
+      ######################################
+      # GitLab CI Lint API Endpoint
+      ######################################
+      url = (
+          f"{os.environ['CI_API_V4_URL']}"
+          f"/projects/{os.environ['CI_PROJECT_ID']}/ci/lint"
+      )
+
+      ######################################
+      # Validate Each Shared Template
+      ######################################
+      for file_path in files:
+
+          ##################################
+          # Skip missing optional templates
+          ##################################
+          if not os.path.exists(file_path):
+              print(f"Skipping missing file: {file_path}")
+              continue
+
+          ##################################
+          # Read pipeline template content
+          ##################################
+          with open(file_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          ##################################
+          # Build GitLab Lint API payload
+          #
+          # include_merged_yaml=true:
+          # - validates includes/extends expansion
+          # - closer to real GitLab evaluation
+          ##################################
+          payload = json.dumps({
+              "content": content,
+              "include_merged_yaml": True
+          }).encode("utf-8")
+
+          ##################################
+          # Build authenticated API request
+          ##################################
+          request = urllib.request.Request(
+              url,
+              data=payload,
+              method="POST",
+              headers={
+                  "PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"],
+                  "Content-Type": "application/json",
+              },
+          )
+
+          print(f"Validating GitLab CI syntax for {file_path}")
+
+          ##################################
+          # Execute API request
+          #
+          # Enterprise Goal:
+          # - fail immediately on invalid template
+          ##################################
+          try:
+              with urllib.request.urlopen(request) as response:
+                  result = json.loads(
+                      response.read().decode("utf-8")
+                  )
+
+          ##################################
+          # Handle GitLab API errors cleanly
+          ##################################
+          except urllib.error.HTTPError as error:
+              print(error.read().decode("utf-8"))
+              raise SystemExit(error.code)
+
+          ##################################
+          # Print validation response
+          ##################################
+          print(json.dumps(result, indent=2))
+
+          ##################################
+          # Fail pipeline if GitLab reports
+          # invalid CI configuration
+          ##################################
+          if not result.get("valid", False):
+
+              errors = result.get("errors", [])
+
+              raise SystemExit(
+                  f"ERROR: GitLab CI lint failed "
+                  f"for {file_path}: {errors}"
+              )
+
+      ######################################
+      # Success Message
+      ######################################
+      print("All GitLab CI templates passed lint validation.")
+
+      PY

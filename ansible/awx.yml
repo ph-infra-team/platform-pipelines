@@ -1,0 +1,286 @@
+############################################
+# Shared AWX Pipeline Library
+# Repo: infra_team/platform-pipelines
+# File: ansible/awx.yml
+############################################
+
+############################################
+# AWX Defaults
+############################################
+.awx_defaults:
+  image: registry.midhtech.local:5050/infra_team/platform-images/ansible-awx:latest
+  tags:
+    - platform
+  variables:
+    AWX_HOSTS_JSON_FILE: "awx_hosts.json"
+    AWX_CLEANUP_ENABLED: "false"
+    AWX_CLEANUP_MODE: "hosts"
+
+############################################
+# AWX Validate Connection
+############################################
+.awx_validate:
+  extends: .awx_defaults
+  script:
+    - awx --version
+    - jq --version
+    - |
+      awx --conf.host "$AWX_HOST" \
+          --conf.username "$AWX_USERNAME" \
+          --conf.password "$AWX_PASSWORD" \
+          --conf.insecure login
+    - awx me
+
+############################################
+# AWX Inventory / Group / Host Upsert
+# Idempotent behavior:
+# - If inventory exists: reuse
+# - If group exists: modify
+# - If group does not exist: create
+# - If host exists: modify
+# - If host does not exist: create
+############################################
+.awx_inventory_upsert:
+  extends: .awx_defaults
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      echo "Logging into AWX..."
+      awx --conf.host "$AWX_HOST" \
+          --conf.username "$AWX_USERNAME" \
+          --conf.password "$AWX_PASSWORD" \
+          --conf.insecure login
+
+      if [ ! -f "$AWX_HOSTS_JSON_FILE" ]; then
+        echo "ERROR: $AWX_HOSTS_JSON_FILE not found"
+        exit 1
+      fi
+
+      echo "Validating JSON input..."
+      jq empty "$AWX_HOSTS_JSON_FILE"
+
+      ORG_NAME="${AWX_ORGANIZATION:-Default}"
+      INVENTORY_NAME=$(jq -r '.inventory.name // empty' "$AWX_HOSTS_JSON_FILE")
+
+      if [ -z "$INVENTORY_NAME" ]; then
+        echo "ERROR: inventory.name is required in $AWX_HOSTS_JSON_FILE"
+        exit 1
+      fi
+
+      echo "Checking AWX inventory: $INVENTORY_NAME"
+      INVENTORY_ID=$(awx inventories list \
+        --organization "$ORG_NAME" \
+        --name "$INVENTORY_NAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$INVENTORY_ID" ]; then
+        echo "Inventory does not exist. Creating: $INVENTORY_NAME"
+
+        INVENTORY_DESC=$(jq -r '.inventory.description // "Managed by GitLab pipeline"' "$AWX_HOSTS_JSON_FILE")
+
+        INVENTORY_ID=$(awx inventories create \
+          --organization "$ORG_NAME" \
+          --name "$INVENTORY_NAME" \
+          --description "$INVENTORY_DESC" \
+          -f json | jq -r '.id')
+      else
+        echo "Inventory already exists. Reusing ID: $INVENTORY_ID"
+      fi
+
+      echo "Processing groups..."
+      jq -c '.groups[]?' "$AWX_HOSTS_JSON_FILE" | while read -r group; do
+        GROUP_NAME=$(echo "$group" | jq -r '.name')
+        GROUP_DESC=$(echo "$group" | jq -r '.description // "Managed by GitLab pipeline"')
+        GROUP_VARS=$(echo "$group" | jq -c '.variables // {}')
+
+        GROUP_ID=$(awx groups list \
+          --inventory "$INVENTORY_ID" \
+          --name "$GROUP_NAME" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$GROUP_ID" ]; then
+          echo "Creating AWX group: $GROUP_NAME"
+          awx groups create \
+            --inventory "$INVENTORY_ID" \
+            --name "$GROUP_NAME" \
+            --description "$GROUP_DESC" \
+            --variables "$GROUP_VARS"
+        else
+          echo "Updating AWX group: $GROUP_NAME"
+          awx groups modify "$GROUP_ID" \
+            --description "$GROUP_DESC" \
+            --variables "$GROUP_VARS"
+        fi
+      done
+
+      echo "Processing hosts..."
+      jq -c '.hosts[]' "$AWX_HOSTS_JSON_FILE" | while read -r host; do
+        HOST_NAME=$(echo "$host" | jq -r '.name')
+        HOST_DESC=$(echo "$host" | jq -r '.description // "Managed by GitLab pipeline"')
+        HOST_GROUP=$(echo "$host" | jq -r '.group // empty')
+        HOST_VARS=$(echo "$host" | jq -c '.variables // {}')
+
+        HOST_ID=$(awx hosts list \
+          --inventory "$INVENTORY_ID" \
+          --name "$HOST_NAME" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$HOST_ID" ]; then
+          echo "Creating AWX host: $HOST_NAME"
+          HOST_ID=$(awx hosts create \
+            --inventory "$INVENTORY_ID" \
+            --name "$HOST_NAME" \
+            --description "$HOST_DESC" \
+            --variables "$HOST_VARS" \
+            -f json | jq -r '.id')
+        else
+          echo "Updating AWX host: $HOST_NAME"
+          awx hosts modify "$HOST_ID" \
+            --description "$HOST_DESC" \
+            --variables "$HOST_VARS"
+        fi
+
+        if [ -n "$HOST_GROUP" ]; then
+          GROUP_ID=$(awx groups list \
+            --inventory "$INVENTORY_ID" \
+            --name "$HOST_GROUP" \
+            -f json | jq -r '.results[0].id // empty')
+
+          if [ -n "$GROUP_ID" ]; then
+            echo "Associating host $HOST_NAME with group $HOST_GROUP"
+            awx groups associate "$GROUP_ID" --host "$HOST_ID" || true
+          else
+            echo "WARNING: group $HOST_GROUP not found. Host created without group association."
+          fi
+        fi
+      done
+
+      echo "AWX inventory sync completed."
+
+############################################
+# AWX Job Template Launch
+# Separate from inventory sync.
+############################################
+.awx_launch_job:
+  extends: .awx_defaults
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      awx --conf.host "$AWX_HOST" \
+          --conf.username "$AWX_USERNAME" \
+          --conf.password "$AWX_PASSWORD" \
+          --conf.insecure login
+
+      if [ -z "$AWX_JOB_TEMPLATE" ]; then
+        echo "ERROR: AWX_JOB_TEMPLATE is required"
+        exit 1
+      fi
+
+      echo "Launching AWX job template: $AWX_JOB_TEMPLATE"
+      awx job_templates launch "$AWX_JOB_TEMPLATE" --monitor
+
+############################################
+# AWX Cleanup
+# Optional cleanup after automation.
+# Controlled by:
+# - AWX_CLEANUP_ENABLED=true
+# - AWX_CLEANUP_MODE=hosts | groups | inventory | all
+# - CHANGE_TICKET_ID required
+############################################
+.awx_cleanup:
+  extends: .awx_defaults
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ "$AWX_CLEANUP_ENABLED" != "true" ]; then
+        echo "ERROR: AWX_CLEANUP_ENABLED must be true"
+        exit 1
+      fi
+
+      if [ -z "$CHANGE_TICKET_ID" ]; then
+        echo "ERROR: CHANGE_TICKET_ID is required for AWX cleanup"
+        exit 1
+      fi
+
+      if [ ! -f "$AWX_HOSTS_JSON_FILE" ]; then
+        echo "ERROR: $AWX_HOSTS_JSON_FILE not found"
+        exit 1
+      fi
+
+      echo "Approved cleanup ticket: $CHANGE_TICKET_ID"
+
+      awx --conf.host "$AWX_HOST" \
+          --conf.username "$AWX_USERNAME" \
+          --conf.password "$AWX_PASSWORD" \
+          --conf.insecure login
+
+      ORG_NAME="${AWX_ORGANIZATION:-Default}"
+      INVENTORY_NAME=$(jq -r '.inventory.name // empty' "$AWX_HOSTS_JSON_FILE")
+
+      INVENTORY_ID=$(awx inventories list \
+        --organization "$ORG_NAME" \
+        --name "$INVENTORY_NAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$INVENTORY_ID" ]; then
+        echo "Inventory not found. Nothing to clean."
+        exit 0
+      fi
+
+      if [ "$AWX_CLEANUP_MODE" = "hosts" ] || [ "$AWX_CLEANUP_MODE" = "all" ]; then
+        jq -c '.hosts[]?' "$AWX_HOSTS_JSON_FILE" | while read -r host; do
+          HOST_NAME=$(echo "$host" | jq -r '.name')
+
+          HOST_ID=$(awx hosts list \
+            --inventory "$INVENTORY_ID" \
+            --name "$HOST_NAME" \
+            -f json | jq -r '.results[0].id // empty')
+
+          if [ -n "$HOST_ID" ]; then
+            echo "Deleting AWX host: $HOST_NAME"
+            awx hosts delete "$HOST_ID"
+          else
+            echo "Host not found, skipping: $HOST_NAME"
+          fi
+        done
+      fi
+
+      if [ "$AWX_CLEANUP_MODE" = "groups" ] || [ "$AWX_CLEANUP_MODE" = "all" ]; then
+        jq -c '.groups[]?' "$AWX_HOSTS_JSON_FILE" | while read -r group; do
+          GROUP_NAME=$(echo "$group" | jq -r '.name')
+
+          GROUP_ID=$(awx groups list \
+            --inventory "$INVENTORY_ID" \
+            --name "$GROUP_NAME" \
+            -f json | jq -r '.results[0].id // empty')
+
+          if [ -n "$GROUP_ID" ]; then
+            echo "Deleting AWX group: $GROUP_NAME"
+            awx groups delete "$GROUP_ID"
+          else
+            echo "Group not found, skipping: $GROUP_NAME"
+          fi
+        done
+      fi
+
+      if [ "$AWX_CLEANUP_MODE" = "inventory" ] || [ "$AWX_CLEANUP_MODE" = "all" ]; then
+        echo "Deleting AWX inventory: $INVENTORY_NAME"
+        awx inventories delete "$INVENTORY_ID"
+      fi
+
+      echo "AWX cleanup completed."

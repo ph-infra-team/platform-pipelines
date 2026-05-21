@@ -1,0 +1,637 @@
+############################################
+# Shared Terraform AWS Live Pipeline Library
+# Repo: infra_team/platform-pipelines
+# File: terraform/live/aws.yml
+#
+# Purpose:
+# - Single include wrapper for AWS Terraform live repos
+# - Includes common security and pipeline governance
+# - Owns enterprise stage contract for live repos
+# - Runs Terraform fmt, validate, plan, policy, apply, destroy
+# - Uses GitLab HTTP backend for Terraform state
+############################################
+
+include:
+  - project: infra_team/platform-pipelines
+    ref: main
+    file: security/common-security.yml
+  - project: infra_team/platform-pipelines
+    ref: main
+    file: security/pipeline-policy.yml
+
+############################################
+# Enterprise Stage Contract
+#
+# Purpose:
+# - Makes this shared template self-contained and GitLab CI-lintable
+# - Ensures all jobs from included templates have valid stages
+# - Consuming live repos only need to include this shared template
+#
+# Flow:
+# - security: secrets and pipeline governance
+# - governance: Terraform source-level OPA checks
+# - compliance: Checkov/static compliance scans
+# - lint: TFLint
+# - fmt: Terraform formatting
+# - validate: Terraform validation
+# - plan: Terraform plan and tfplan.json artifact
+# - policy: Terraform plan-level OPA checks
+# - apply/destroy: protected manual lifecycle actions
+# - configure: optional AWX/AAP post-provisioning integration
+############################################
+stages:
+  - security
+  - governance
+  - compliance
+  - lint
+  - fmt
+  - validate
+  - plan
+  - policy
+  - apply
+  - destroy
+  - configure
+
+variables:
+  PIPELINE_POLICY_PATH: "platform-policies/pipeline/live"
+  TERRAFORM_SOURCE_POLICY_PATH: "platform-policies/terraform/live/source"
+  TERRAFORM_PLAN_POLICY_PATH: "platform-policies/terraform/plan"
+  CHECKOV_SKIP_CHECKS: "CKV_TF_1"
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"
+
+############################################
+# Global Terraform Defaults
+############################################
+.terraform_defaults:
+  image: registry.midhtech.local:5050/infra_team/platform-images/terraform-aws:latest
+  tags:
+    - platform
+
+############################################
+# Terraform Init
+#
+# Purpose:
+# - Configures GitLab-managed Terraform HTTP state backend
+# - Uses CI_JOB_TOKEN by default for backend auth
+# - Exports AWS credentials from GitLab CI/CD variables
+# - Verifies AWS identity before Terraform operations
+############################################
+.terraform_init:
+  extends:
+    - .terraform_defaults
+  before_script:
+    - export TF_STATE_NAME="${TF_STATE_NAME:-$CI_PROJECT_NAME}"
+    - export TF_HTTP_ADDRESS="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}"
+    - export TF_HTTP_LOCK_ADDRESS="${TF_HTTP_ADDRESS}/lock"
+    - export TF_HTTP_UNLOCK_ADDRESS="${TF_HTTP_ADDRESS}/lock"
+    - export TF_HTTP_LOCK_METHOD="POST"
+    - export TF_HTTP_UNLOCK_METHOD="DELETE"
+    - export TF_HTTP_RETRY_WAIT_MIN="5"
+    - export TF_HTTP_USERNAME="gitlab-ci-token"
+    - export TF_HTTP_PASSWORD="${CI_JOB_TOKEN}"
+
+    # GitLab Terraform Module Registry authentication.
+    # Required for downloading private versioned Terraform modules from:
+    # source = "gitlab.midhtech.local/cloud_team/s3-bucket/aws"
+    #
+    # This is separate from Terraform HTTP backend authentication.
+    # CI_JOB_TOKEN is preferred here because module repos allow tf-live group
+    # access through GitLab Job Token Permissions.
+    - |
+      cat > ~/.terraformrc <<EOF
+      credentials "gitlab.midhtech.local" {
+        token = "${CI_JOB_TOKEN}"
+      }
+      EOF
+
+    # GitLab Terraform backend authentication.
+    # Defaults to CI_JOB_TOKEN so consuming repos do not need separate TF_HTTP_PASSWORD variables.
+    # but getting error - check later
+    # - export TF_HTTP_USERNAME="${TF_HTTP_USERNAME:-gitlab-ci-token}"
+    # - export TF_HTTP_PASSWORD="${TF_HTTP_PASSWORD:-${CI_JOB_TOKEN}}"
+    # - export TF_HTTP_USERNAME="${TF_HTTP_USERNAME}"
+    # - export TF_HTTP_PASSWORD="${TF_HTTP_PASSWORD}"
+
+    # AWS authentication injected from GitLab CI/CD variables.
+    # Required variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+    # AWS_DEFAULT_REGION is required for Terraform AWS provider and is validated in the script.
+    # AWS credentials are required for Terraform init to verify connectivity to AWS and backend.
+    # We are still using AWS credentials instead of OIDC for Terraform operations because:
+    # we have gitlab hosted on http and OIDC provider requires https, and we would need
+    # to manage separate OIDC credentials in GitLab CI/CD variables which adds complexity.
+    - export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+    - export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+    - export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}"
+
+    # Required enterprise variables.
+    - |
+      if [ -z "$AWS_DEFAULT_REGION" ]; then
+        echo "ERROR: AWS_DEFAULT_REGION is required."
+        exit 1
+      fi
+
+      # if [ -z "$TF_HTTP_USERNAME" ]; then
+      #   echo "ERROR: TF_HTTP_USERNAME is required for GitLab Terraform HTTP backend."
+      #   exit 1
+      # fi
+
+      # if [ -z "$TF_HTTP_PASSWORD" ]; then
+      #   echo "ERROR: TF_HTTP_PASSWORD is required for GitLab Terraform HTTP backend."
+      #   exit 1
+      # fi
+
+    # Git authentication for temporary HTTP Git module sources.
+    # This allows Terraform to clone private module repos using CI_JOB_TOKEN
+    # without putting tokens inside Terraform source code.
+    - git config --global url."http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/".insteadOf "http://gitlab.midhtech.local/"
+    - terraform --version
+    - aws --version
+    - aws sts get-caller-identity
+    - |
+      terraform init -input=false -reconfigure \
+        -backend-config="address=${TF_HTTP_ADDRESS}" \
+        -backend-config="lock_address=${TF_HTTP_LOCK_ADDRESS}" \
+        -backend-config="unlock_address=${TF_HTTP_UNLOCK_ADDRESS}" \
+        -backend-config="lock_method=${TF_HTTP_LOCK_METHOD}" \
+        -backend-config="unlock_method=${TF_HTTP_UNLOCK_METHOD}" \
+        -backend-config="retry_wait_min=${TF_HTTP_RETRY_WAIT_MIN}" \
+        -backend-config="username=gitlab-ci-token" \
+        -backend-config="password=${CI_JOB_TOKEN}"
+
+############################################
+# Terraform fmt
+#
+# Purpose:
+# - Enforces Terraform formatting standard
+############################################
+.terraform_fmt:
+  extends: .terraform_defaults
+  script:
+    - terraform fmt -check -recursive
+
+############################################
+# Terraform validate
+#
+# Purpose:
+# - Validates Terraform syntax and provider configuration
+############################################
+.terraform_validate:
+  extends: .terraform_init
+  script:
+    - terraform validate
+
+############################################
+# Terraform plan
+#
+# Purpose:
+# - Creates Terraform execution plan
+# - Saves tfplan artifact for apply and future policy evaluation
+############################################
+.terraform_plan:
+  extends: .terraform_init
+  script:
+    - terraform plan -input=false -out=tfplan
+    - terraform show -json tfplan > tfplan.json
+  artifacts:
+    name: "tfplan-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - tfplan
+      - tfplan.json
+    expire_in: 7 days
+
+############################################
+# Terraform Source Policy Enforcement
+# Tool: Conftest / OPA
+#
+# Purpose:
+# - Validate Terraform source code against enterprise policies
+# - Detect governance violations BEFORE terraform plan
+# - Enforce approved module usage and enterprise standards
+#
+# Examples:
+# - deny raw resources
+# - require approved modules
+# - required tags
+# - approved regions
+# - naming conventions
+############################################
+conftest-source-check:
+  stage: governance
+  extends: .security_defaults
+  allow_failure: false
+  script:
+    - conftest --version
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-policies.git
+    - |
+      TF_FILES=$(find . -type f -name "*.tf" \
+        -not -path "./.terraform/*" \
+        -not -path "./platform-policies/*" \
+        -not -path "./.git/*")
+
+      if [ -z "$TF_FILES" ]; then
+        echo "No Terraform files found."
+        exit 0
+      fi
+
+      if [ ! -d "$TERRAFORM_SOURCE_POLICY_PATH" ]; then
+        echo "ERROR: Terraform source policy path not found: $TERRAFORM_SOURCE_POLICY_PATH"
+        exit 1
+      fi
+    - |
+      echo "Running Terraform live repository structure checks..."
+
+      grep -R 'backend "http"' . \
+        --include="*.tf" \
+        --exclude-dir=".terraform" \
+        --exclude-dir="platform-policies" \
+        --exclude-dir=".git" >/dev/null || {
+          echo 'ERROR: Live repo must define terraform { backend "http" {} }.'
+          exit 1
+        }
+
+      test -f versions.tf || {
+        echo "ERROR: versions.tf is required."
+        exit 1
+      }
+
+      test -f provider.tf || {
+        echo "ERROR: provider.tf is required."
+        exit 1
+      }
+
+      test -f main.tf || {
+        echo "ERROR: main.tf is required."
+        exit 1
+      }
+
+      echo "Live repository structure validation passed."
+
+      conftest test $TF_FILES \
+        --policy "$TERRAFORM_SOURCE_POLICY_PATH" \
+        --all-namespaces
+
+############################################
+# Terraform Plan Policy Enforcement
+# Tool: Conftest / OPA
+#
+# Purpose:
+# - Validate Terraform plan JSON against enterprise policies
+# - Blocks merge if infrastructure violates governance rules
+#
+# Requirements:
+# - plan job must generate tfplan.json artifact
+############################################
+terraform-policy-check:
+  stage: policy
+  extends: .security_defaults
+  needs:
+    - job: plan
+      artifacts: true
+  script:
+    - conftest --version
+
+    # Clone central policy repository
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-policies.git
+
+    # Ensure tfplan.json exists
+    - |
+      if [ ! -f "tfplan.json" ]; then
+        echo "ERROR: tfplan.json not found."
+        echo "Make sure terraform plan creates tfplan.json"
+        exit 1
+      fi
+
+      if [ ! -d "$TERRAFORM_PLAN_POLICY_PATH" ]; then
+        echo "ERROR: Terraform plan policy path not found: $TERRAFORM_PLAN_POLICY_PATH"
+        exit 1
+      fi
+
+      conftest test tfplan.json \
+        --policy "$TERRAFORM_PLAN_POLICY_PATH" \
+        --all-namespaces
+
+############################################
+# Terraform apply
+#
+# Purpose:
+# - Manual approval only
+# - Main branch only
+# - Applies previously generated Terraform plan
+#
+# Note:
+# - Artifact dependency is enforced in the exposed apply job using needs.
+############################################
+.terraform_apply:
+  extends: .terraform_init
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - terraform plan -input=false -out=tfplan
+    - terraform apply -input=false -auto-approve tfplan
+    - terraform output -json > outputs.json
+  artifacts:
+    name: "terraform-outputs-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - outputs.json
+    expire_in: 7 days
+
+############################################
+# Terraform destroy
+#
+# Purpose:
+# - Manual break-glass destroy
+# - Main branch only
+# - Requires explicit ALLOW_DESTROY=true
+# - Requires CHANGE_TICKET_ID for audit trail
+############################################
+.terraform_destroy:
+  extends: .terraform_init
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      if [ "$ALLOW_DESTROY" != "true" ]; then
+        echo "ERROR: ALLOW_DESTROY must be set to true"
+        exit 1
+      fi
+
+      if [ -z "$CHANGE_TICKET_ID" ]; then
+        echo "ERROR: CHANGE_TICKET_ID is required"
+        exit 1
+      fi
+
+      echo "Approved change ticket: $CHANGE_TICKET_ID"
+      terraform destroy -input=false -auto-approve
+
+############################################
+# Optional AWX Inventory Sync
+#
+# Purpose:
+# - Consuming repos extend this only when needed
+# - Not enabled by default
+# - AWX organization defaults from Terraform owner output
+# - AWX inventory defaults from application-environment output
+# - Live repos can override AWX_ORGANIZATION, AWX_INVENTORY, AWX_GROUP
+############################################
+.terraform_awx_sync:
+  image: registry.midhtech.local:5050/infra_team/platform-images/ansible-awx:latest
+  tags:
+    - platform
+  variables:
+    AWX_HOST: "http://awx.midhtech.local"
+    AWX_CREATE_ORGANIZATION: "true"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ ! -f "outputs.json" ]; then
+        echo "ERROR: outputs.json artifact not found. Run apply first and pass apply artifacts to the AWX job."
+        exit 1
+      fi
+
+      if [ -z "$AWX_HOST" ]; then
+        echo "ERROR: AWX_HOST is required."
+        exit 1
+      fi
+
+      if [ -z "$AWX_USERNAME" ]; then
+        echo "ERROR: AWX_USERNAME is required."
+        exit 1
+      fi
+
+      if [ -z "$AWX_PASSWORD" ]; then
+        echo "ERROR: AWX_PASSWORD is required."
+        exit 1
+      fi
+
+      PRIVATE_IP=$(jq -r '.private_ip.value // .instance_ips.value[0] // empty' outputs.json)
+      INSTANCE_ID=$(jq -r '.instance_id.value // empty' outputs.json)
+      HOSTNAME=$(jq -r '.hostname.value // .private_ip.value // empty' outputs.json)
+      ENVIRONMENT=$(jq -r '.environment.value // empty' outputs.json)
+      APPLICATION=$(jq -r '.application.value // empty' outputs.json)
+      OWNER=$(jq -r '.owner.value // empty' outputs.json)
+
+      if [ -z "$PRIVATE_IP" ]; then
+        echo "ERROR: Terraform output private_ip or instance_ips is required for AWX inventory sync."
+        exit 1
+      fi
+
+      if [ -z "$OWNER" ]; then
+        echo "ERROR: Terraform output owner is required for AWX organization default."
+        exit 1
+      fi
+
+      if [ -z "$APPLICATION" ]; then
+        echo "ERROR: Terraform output application is required for AWX inventory default."
+        exit 1
+      fi
+
+      if [ -z "$ENVIRONMENT" ]; then
+        echo "ERROR: Terraform output environment is required for AWX inventory default."
+        exit 1
+      fi
+
+      if [ -z "$HOSTNAME" ]; then
+        HOSTNAME="$PRIVATE_IP"
+      fi
+
+      DEFAULT_AWX_ORGANIZATION="$OWNER"
+      DEFAULT_AWX_INVENTORY="${APPLICATION}-${ENVIRONMENT}"
+
+      AWX_ORGANIZATION="${AWX_ORGANIZATION:-$DEFAULT_AWX_ORGANIZATION}"
+      AWX_INVENTORY="${AWX_INVENTORY:-$DEFAULT_AWX_INVENTORY}"
+
+      echo "AWX organization: $AWX_ORGANIZATION"
+      echo "AWX inventory: $AWX_INVENTORY"
+      echo "AWX group: ${AWX_GROUP:-none}"
+      echo "AWX host: $HOSTNAME"
+      echo "Private IP: $PRIVATE_IP"
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      ORG_ID=$(awx_cmd organizations list \
+        --name "$AWX_ORGANIZATION" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$ORG_ID" ]; then
+        if [ "$AWX_CREATE_ORGANIZATION" = "true" ]; then
+          echo "Creating AWX organization: $AWX_ORGANIZATION"
+          awx_cmd organizations create \
+            --name "$AWX_ORGANIZATION" \
+            --description "Managed by GitLab Terraform pipeline from owner tag" \
+            -f json || true
+
+          ORG_ID=$(awx_cmd organizations list \
+            --name "$AWX_ORGANIZATION" \
+            -f json | jq -r '.results[0].id // empty')
+
+          if [ -z "$ORG_ID" ]; then
+            echo "ERROR: AWX organization '$AWX_ORGANIZATION' was not found after create."
+            exit 1
+          fi
+        else
+          echo "ERROR: AWX organization '$AWX_ORGANIZATION' does not exist and AWX_CREATE_ORGANIZATION is not true."
+          exit 1
+        fi
+      else
+        echo "Using existing AWX organization: $AWX_ORGANIZATION"
+      fi
+
+      INVENTORY_ID=$(awx_cmd inventories list \
+        --organization "$AWX_ORGANIZATION" \
+        --name "$AWX_INVENTORY" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$INVENTORY_ID" ]; then
+        echo "Creating AWX inventory: $AWX_INVENTORY"
+        awx_cmd inventories create \
+          --organization "$AWX_ORGANIZATION" \
+          --name "$AWX_INVENTORY" \
+          --description "Managed by GitLab Terraform pipeline" \
+          -f json || true
+
+        INVENTORY_ID=$(awx_cmd inventories list \
+          --organization "$AWX_ORGANIZATION" \
+          --name "$AWX_INVENTORY" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$INVENTORY_ID" ]; then
+          echo "ERROR: AWX inventory '$AWX_INVENTORY' was not found after create."
+          exit 1
+        fi
+      else
+        echo "Using existing AWX inventory: $AWX_INVENTORY"
+      fi
+
+      GROUP_ID=""
+      if [ -n "$AWX_GROUP" ]; then
+        GROUP_ID=$(awx_cmd groups list \
+          --inventory "$INVENTORY_ID" \
+          --name "$AWX_GROUP" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$GROUP_ID" ]; then
+          echo "Creating AWX group: $AWX_GROUP"
+          awx_cmd groups create \
+            --inventory "$INVENTORY_ID" \
+            --name "$AWX_GROUP" \
+            --description "Managed by GitLab Terraform pipeline" \
+            -f json || true
+
+          GROUP_ID=$(awx_cmd groups list \
+            --inventory "$INVENTORY_ID" \
+            --name "$AWX_GROUP" \
+            -f json | jq -r '.results[0].id // empty')
+
+          if [ -z "$GROUP_ID" ]; then
+            echo "ERROR: AWX group '$AWX_GROUP' was not found after create."
+            exit 1
+          fi
+        else
+          echo "Using existing AWX group: $AWX_GROUP"
+        fi
+      fi
+
+      HOST_VARS=$(jq -n \
+        --arg ansible_host "$PRIVATE_IP" \
+        --arg private_ip "$PRIVATE_IP" \
+        --arg instance_id "$INSTANCE_ID" \
+        --arg environment "$ENVIRONMENT" \
+        --arg application "$APPLICATION" \
+        --arg owner "$OWNER" \
+        '{
+          ansible_host: $ansible_host,
+          private_ip: $private_ip,
+          instance_id: $instance_id,
+          environment: $environment,
+          application: $application,
+          owner: $owner,
+          managed_by: "gitlab-terraform"
+        }')
+
+      HOST_ID=$(awx_cmd hosts list \
+        --inventory "$INVENTORY_ID" \
+        --name "$HOSTNAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$HOST_ID" ]; then
+        echo "Creating AWX host: $HOSTNAME"
+        awx_cmd hosts create \
+          --inventory "$INVENTORY_ID" \
+          --name "$HOSTNAME" \
+          --description "Terraform-managed EC2 host $PRIVATE_IP" \
+          --variables "$HOST_VARS" \
+          -f json || true
+
+        HOST_ID=$(awx_cmd hosts list \
+          --inventory "$INVENTORY_ID" \
+          --name "$HOSTNAME" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$HOST_ID" ]; then
+          echo "ERROR: AWX host '$HOSTNAME' was not found after create."
+          exit 1
+        fi
+      else
+        echo "Updating AWX host: $HOSTNAME"
+        awx_cmd hosts modify "$HOST_ID" \
+          --description "Terraform-managed EC2 host $PRIVATE_IP" \
+          --variables "$HOST_VARS"
+      fi
+
+      if [ -n "$GROUP_ID" ]; then
+        echo "Associating AWX host $HOSTNAME with group $AWX_GROUP"
+        curl --fail-with-body --silent --show-error \
+          --user "$AWX_USERNAME:$AWX_PASSWORD" \
+          --header "Content-Type: application/json" \
+          --request POST \
+          --data "{\"id\": ${HOST_ID}}" \
+          "${AWX_HOST%/}/api/v2/groups/${GROUP_ID}/hosts/"
+      fi
+
+############################################
+# Default Jobs Exposed to Consuming Repos
+############################################
+fmt:
+  stage: fmt
+  extends: .terraform_fmt
+
+validate:
+  stage: validate
+  extends: .terraform_validate
+
+plan:
+  stage: plan
+  extends: .terraform_plan
+
+apply:
+  stage: apply
+  extends: .terraform_apply
+  needs:
+    - job: plan
+      artifacts: true
+    - job: terraform-policy-check
+      artifacts: false
+
+destroy:
+  stage: destroy
+  extends: .terraform_destroy
+  needs:
+    - job: terraform-policy-check
+      artifacts: false

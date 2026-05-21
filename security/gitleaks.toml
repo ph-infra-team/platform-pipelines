@@ -1,0 +1,15 @@
+title = "Midhtech Gitleaks Rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hardcoded-secret-assignment"
+description = "Detect hardcoded secrets assigned to secret-like variable names, allow templated variables"
+regex = '''(?i)([A-Za-z0-9_.-]*(password|passwd|pwd|secret|token|credential|creds|api[_-]?key|access[_-]?key|private[_-]?key|vault)[A-Za-z0-9_.-]*)\s*[:=]\s*["']([^"']{8,})["']'''
+secretGroup = 3
+
+[[rules.allowlists]]
+regexes = [
+  '''(?i)([A-Za-z0-9_.-]*(password|passwd|pwd|secret|token|credential|creds|api[_-]?key|access[_-]?key|private[_-]?key|vault)[A-Za-z0-9_.-]*)\s*[:=]\s*["']\{\{\s*[A-Za-z0-9_.-]+\s*\}\}["']'''
+]

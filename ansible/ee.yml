@@ -1,0 +1,282 @@
+############################################
+# Shared Ansible Execution Environment Pipeline
+# Repo: infra_team/platform-pipelines
+# File: ansible/ee.yml
+#
+# Purpose:
+# - Build AWX/AAP execution environment images from repo-owned EE definitions
+# - Push versioned images to the GitLab Container Registry
+# - Optionally register or update the image in AWX
+#
+# Expected consuming repo files:
+# - execution-environment.yml
+# - requirements.yml
+# - requirements.txt
+# - bindep.txt
+############################################
+
+stages:
+  - validate
+  - build
+  - smoke
+  - publish
+  - register
+
+variables:
+  EE_DEFINITION_FILE: "execution-environment.yml"
+  EE_IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  EE_IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  EE_LATEST_TAG: "latest"
+  EE_VERSION_TAG: "$CI_COMMIT_TAG"
+  EE_REGISTER_IN_AWX: "false"
+  EE_SMOKE_COLLECTIONS: ""
+  EE_SMOKE_CONNECTION_PLUGINS: ""
+  EE_SMOKE_PYTHON_IMPORTS: ""
+  EE_SMOKE_PYTHON_BIN: "python3"
+  EE_SMOKE_EXECUTABLES: ""
+  AWX_HOST: "http://awx.midhtech.local"
+  AWX_EE_NAME: "$CI_PROJECT_NAME"
+  AWX_EE_PULL: "always"
+  AWX_EE_REGISTRY_CREDENTIAL_NAME: ""
+
+############################################
+# Validate EE Source
+#
+# Enterprise purpose:
+# - Fail fast before any container build starts
+# - Confirm every EE repo follows the required source contract
+# - Validate that ansible-builder can parse the EE definition
+#
+# Image rationale:
+# - python:3.11-slim is only a lightweight bootstrap image for ansible-builder
+# - This job does not need Docker or AWX credentials
+# - Later, this can be replaced by an internally mirrored Python CI image
+############################################
+validate-ee-source:
+  stage: validate
+  image: python:3.11-slim
+  tags:
+    - platform
+  script:
+    - python --version
+    - |
+      for required_file in "$EE_DEFINITION_FILE" requirements.yml requirements.txt bindep.txt; do
+        if [ ! -f "$required_file" ]; then
+          echo "ERROR: Missing required execution environment file: $required_file"
+          exit 1
+        fi
+      done
+    - pip install --no-cache-dir ansible-builder==3.1.0
+    - ansible-builder --version
+    - ansible-builder create -f "$EE_DEFINITION_FILE" --context /tmp/ee-context
+
+############################################
+# Build EE Image
+#
+# Enterprise purpose:
+# - Convert repo-owned EE source files into a runnable AWX/AAP image
+# - Produce immutable image tags for auditability and rollback
+# - Push the image to GitLab Container Registry as the enterprise source of truth
+#
+# Image rationale:
+# - docker:29 provides the Docker client needed to build and push images
+# - docker:dind provides an isolated build daemon for GitLab runners
+# - The final EE image is not docker:29; it is built by ansible-builder
+# - Later, docker:29 can be replaced by an approved internal Docker builder image
+############################################
+build-ee-image:
+  stage: build
+  image: docker:29
+  services:
+    - name: docker:29-dind
+      command: ["--insecure-registry=registry.midhtech.local:5050"]
+  tags:
+    - platform
+  needs:
+    - validate-ee-source
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_BUILDKIT: "0"
+  before_script:
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - apk add --no-cache python3 py3-pip
+    - python3 -m venv /tmp/ansible-builder
+    - . /tmp/ansible-builder/bin/activate
+    - pip install --no-cache-dir ansible-builder==3.1.0
+  script:
+    - |
+      set -e
+
+      IMAGE_TAGS="-t ${EE_IMAGE_NAME}:${EE_IMAGE_TAG}"
+
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        IMAGE_TAGS="${IMAGE_TAGS} -t ${EE_IMAGE_NAME}:${EE_LATEST_TAG}"
+      fi
+
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        IMAGE_TAGS="${IMAGE_TAGS} -t ${EE_IMAGE_NAME}:${EE_VERSION_TAG}"
+      fi
+
+      /tmp/ansible-builder/bin/ansible-builder build \
+        -f "$EE_DEFINITION_FILE" \
+        --container-runtime docker \
+        $IMAGE_TAGS
+    - docker push "${EE_IMAGE_NAME}:${EE_IMAGE_TAG}"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker push "${EE_IMAGE_NAME}:${EE_LATEST_TAG}"
+      fi
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker push "${EE_IMAGE_NAME}:${EE_VERSION_TAG}"
+      fi
+
+############################################
+# Smoke Test EE Image
+#
+# Enterprise purpose:
+# - Verify the pushed EE image contains the runtime expected by its owning repo
+# - Catch missing collections, connection plugins, executables, or Python libraries before AWX registration
+# - Keep checks configurable so this shared pipeline works for any EE type
+#
+# Runtime note:
+# - This job runs inside the newly built EE image
+# - A pass here means AWX can use the same image shape for job templates
+# - Consuming EE repos set EE_SMOKE_* variables for their specific runtime checks
+############################################
+smoke-ee-image:
+  stage: smoke
+  image: "${EE_IMAGE_NAME}:${EE_IMAGE_TAG}"
+  tags:
+    - platform
+  needs:
+    - build-ee-image
+  script:
+    - ansible --version
+    - |
+      set -e
+
+      for collection in $EE_SMOKE_COLLECTIONS; do
+        echo "Checking Ansible collection: $collection"
+        ansible-galaxy collection list "$collection"
+      done
+
+      for connection_plugin in $EE_SMOKE_CONNECTION_PLUGINS; do
+        echo "Checking Ansible connection plugin: $connection_plugin"
+        ansible-doc -t connection "$connection_plugin"
+      done
+
+      for executable in $EE_SMOKE_EXECUTABLES; do
+        echo "Checking executable: $executable"
+        command -v "$executable"
+        "$executable" --version || true
+      done
+
+      for python_import in $EE_SMOKE_PYTHON_IMPORTS; do
+        echo "Checking Python import: $python_import"
+        "$EE_SMOKE_PYTHON_BIN" -c "import ${python_import}; print('${python_import} import ok')"
+      done
+
+############################################
+# Register / Update AWX EE
+#
+# Enterprise purpose:
+# - Keep AWX Execution Environment records aligned with approved registry images
+# - Avoid manual drift between GitLab-built images and AWX configuration
+# - Make registration explicit and controlled through a manual job
+#
+# Control model:
+# - Disabled by default with EE_REGISTER_IN_AWX=false
+# - Manual only on protected semantic version tags when enabled
+# - main may publish latest, but AWX should use immutable version tags
+# - Uses a service account supplied through masked GitLab CI/CD variables
+# - Optionally attaches an AWX container registry credential so AWX/Receptor can
+#   pull private GitLab registry images at job runtime
+############################################
+register-awx-ee:
+  stage: register
+  image: registry.midhtech.local:5050/infra_team/platform-images/ansible-awx:latest
+  tags:
+    - platform
+  needs:
+    - smoke-ee-image
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $EE_REGISTER_IN_AWX == "true"'
+      when: manual
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ -z "$AWX_USERNAME" ]; then
+        echo "ERROR: AWX_USERNAME is required."
+        exit 1
+      fi
+
+      if [ -z "$AWX_PASSWORD" ]; then
+        echo "ERROR: AWX_PASSWORD is required."
+        exit 1
+      fi
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      EE_IMAGE="${EE_IMAGE_NAME}:${EE_LATEST_TAG}"
+
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        EE_IMAGE="${EE_IMAGE_NAME}:${EE_VERSION_TAG}"
+      fi
+
+      echo "Registering AWX execution environment:"
+      echo "  name: $AWX_EE_NAME"
+      echo "  image: $EE_IMAGE"
+
+      awx_cmd login
+
+      REGISTRY_CREDENTIAL_ID=""
+      if [ -n "$AWX_EE_REGISTRY_CREDENTIAL_NAME" ]; then
+        REGISTRY_CREDENTIAL_ID=$(awx_cmd credentials list \
+          --name "$AWX_EE_REGISTRY_CREDENTIAL_NAME" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -z "$REGISTRY_CREDENTIAL_ID" ]; then
+          echo "ERROR: AWX_EE_REGISTRY_CREDENTIAL_NAME was set, but AWX credential was not found: $AWX_EE_REGISTRY_CREDENTIAL_NAME"
+          exit 1
+        fi
+      fi
+
+      EE_ID=$(awx_cmd execution_environments list \
+        --name "$AWX_EE_NAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$EE_ID" ]; then
+        if [ -n "$REGISTRY_CREDENTIAL_ID" ]; then
+          awx_cmd execution_environments create \
+            --name "$AWX_EE_NAME" \
+            --image "$EE_IMAGE" \
+            --pull "$AWX_EE_PULL" \
+            --credential "$REGISTRY_CREDENTIAL_ID"
+        else
+          awx_cmd execution_environments create \
+            --name "$AWX_EE_NAME" \
+            --image "$EE_IMAGE" \
+            --pull "$AWX_EE_PULL"
+        fi
+      else
+        if [ -n "$REGISTRY_CREDENTIAL_ID" ]; then
+          awx_cmd execution_environments modify "$EE_ID" \
+            --image "$EE_IMAGE" \
+            --pull "$AWX_EE_PULL" \
+            --credential "$REGISTRY_CREDENTIAL_ID"
+        else
+          awx_cmd execution_environments modify "$EE_ID" \
+            --image "$EE_IMAGE" \
+            --pull "$AWX_EE_PULL"
+        fi
+      fi

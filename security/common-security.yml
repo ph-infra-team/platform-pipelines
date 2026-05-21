@@ -1,0 +1,76 @@
+############################################
+# Shared Terraform Security Pipeline Library
+# Repo: infra_team/platform-pipelines
+# File: security/terraform-security.yml
+#
+# Purpose:
+# - Run reusable security and compliance controls for Terraform repos
+# - Detect secrets
+# - Run Terraform static linting
+# - Run Checkov IaC compliance scan
+# - Run optional Conftest/OPA policy checks when a local policy/ directory exists
+############################################
+
+.security_defaults:
+  image: registry.midhtech.local:5050/infra_team/platform-images/iac-security:latest
+  tags:
+    - platform
+
+############################################
+# Secret Detection
+# Tool: Gitleaks
+#
+# Purpose:
+# - Detect hardcoded secrets, tokens, keys, passwords, and credentials
+# - Runs against current repo working directory
+############################################
+secret-detection:
+  stage: security
+  extends: .security_defaults
+  script:
+    - gitleaks version
+    - git clone http://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.midhtech.local/infra_team/platform-pipelines.git /tmp/platform-pipelines
+    - gitleaks detect --source . --no-git --redact --verbose --config /tmp/platform-pipelines/security/gitleaks.toml
+
+############################################
+# Terraform Lint
+# Tool: TFLint
+#
+# Purpose:
+# - Detect Terraform syntax/style/provider issues
+# - Recursive mode supports module folders and environment folders
+############################################
+tflint:
+  stage: lint
+  extends: .security_defaults
+  script:
+    - tflint --version
+    - tflint --init
+    - tflint --recursive
+
+############################################
+# Terraform Compliance Scan
+# Tool: Checkov
+#
+# Purpose:
+# - Run built-in Terraform security/compliance checks
+# - Fails pipeline when HIGH-risk IaC misconfigurations are detected
+#
+# Enterprise note:
+# - CHECKOV_SKIP_CHECKS allows higher-level shared pipelines to define
+#   centrally approved exceptions.
+# - Example: live repos using GitLab Terraform Module Registry may skip
+#   CKV_TF_1 because registry modules are pinned with semantic versions.
+############################################
+checkov:
+  stage: compliance
+  extends: .security_defaults
+  script:
+    - checkov --version
+    - echo "CHECKOV_SKIP_CHECKS=${CHECKOV_SKIP_CHECKS:-}"
+    - |
+      if [ -n "${CHECKOV_SKIP_CHECKS:-}" ]; then
+        checkov -d . --framework terraform --quiet --skip-check "$CHECKOV_SKIP_CHECKS"
+      else
+        checkov -d . --framework terraform --quiet
+      fi
