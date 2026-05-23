@@ -366,7 +366,13 @@ terraform-policy-check:
       fi
 
       echo "Approved change ticket: $CHANGE_TICKET_ID"
+      terraform output -json > outputs.json || echo '{}' > outputs.json
       terraform destroy -input=false -auto-approve
+  artifacts:
+    name: "terraform-destroy-outputs-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - outputs.json
+    expire_in: 7 days
 
 ############################################
 # Optional AWX Inventory Sync
@@ -603,6 +609,168 @@ terraform-policy-check:
           --request POST \
           --data "{\"id\": ${HOST_ID}}" \
           "${AWX_HOST%/}/api/v2/groups/${GROUP_ID}/hosts/"
+      fi
+
+############################################
+# Optional AWX Inventory Cleanup
+#
+# Purpose:
+# - Consuming repos extend this when Terraform created static AWX hosts
+# - Consumes outputs.json captured before terraform destroy
+# - Deletes only the Terraform-managed host by default
+# - Can optionally delete empty group or full inventory when explicitly enabled
+############################################
+.terraform_awx_cleanup:
+  image: registry.midhtech.local:5050/infra_team/platform-images/ansible-awx:latest
+  tags:
+    - platform
+  variables:
+    AWX_HOST: "http://awx.midhtech.local"
+    AWX_DELETE_EMPTY_GROUP: "true"
+    AWX_DELETE_INVENTORY: "false"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      set -e
+
+      if [ "$ALLOW_DESTROY" != "true" ]; then
+        echo "ERROR: ALLOW_DESTROY must be set to true"
+        exit 1
+      fi
+
+      if [ -z "$CHANGE_TICKET_ID" ]; then
+        echo "ERROR: CHANGE_TICKET_ID is required"
+        exit 1
+      fi
+
+      if [ ! -f "outputs.json" ]; then
+        echo "ERROR: outputs.json artifact not found. The destroy job must capture outputs before terraform destroy."
+        exit 1
+      fi
+
+      if [ -z "$AWX_HOST" ]; then
+        echo "ERROR: AWX_HOST is required."
+        exit 1
+      fi
+
+      if [ -z "$AWX_USERNAME" ]; then
+        echo "ERROR: AWX_USERNAME is required."
+        exit 1
+      fi
+
+      if [ -z "$AWX_PASSWORD" ]; then
+        echo "ERROR: AWX_PASSWORD is required."
+        exit 1
+      fi
+
+      PRIVATE_IP=$(jq -r '.private_ip.value // .instance_ips.value[0] // empty' outputs.json)
+      HOSTNAME=$(jq -r '.hostname.value // .private_ip.value // empty' outputs.json)
+      ENVIRONMENT=$(jq -r '.environment.value // empty' outputs.json)
+      APPLICATION=$(jq -r '.application.value // empty' outputs.json)
+      OWNER=$(jq -r '.owner.value // empty' outputs.json)
+
+      if [ -z "$PRIVATE_IP" ]; then
+        echo "No Terraform private_ip or instance_ips output found. Nothing to clean up in AWX."
+        exit 0
+      fi
+
+      if [ -z "$HOSTNAME" ]; then
+        HOSTNAME="$PRIVATE_IP"
+      fi
+
+      if [ -z "$OWNER" ]; then
+        echo "ERROR: Terraform output owner is required for AWX organization default."
+        exit 1
+      fi
+
+      if [ -z "$APPLICATION" ]; then
+        echo "ERROR: Terraform output application is required for AWX inventory default."
+        exit 1
+      fi
+
+      if [ -z "$ENVIRONMENT" ]; then
+        echo "ERROR: Terraform output environment is required for AWX inventory default."
+        exit 1
+      fi
+
+      DEFAULT_AWX_ORGANIZATION="$OWNER"
+      DEFAULT_AWX_INVENTORY="${APPLICATION}-${ENVIRONMENT}"
+
+      AWX_ORGANIZATION="${AWX_ORGANIZATION:-$DEFAULT_AWX_ORGANIZATION}"
+      AWX_INVENTORY="${AWX_INVENTORY:-$DEFAULT_AWX_INVENTORY}"
+
+      echo "AWX cleanup change ticket: $CHANGE_TICKET_ID"
+      echo "AWX organization: $AWX_ORGANIZATION"
+      echo "AWX inventory: $AWX_INVENTORY"
+      echo "AWX group: ${AWX_GROUP:-none}"
+      echo "AWX host: $HOSTNAME"
+      echo "Private IP: $PRIVATE_IP"
+
+      awx_cmd() {
+        awx --conf.host "$AWX_HOST" \
+            --conf.username "$AWX_USERNAME" \
+            --conf.password "$AWX_PASSWORD" \
+            --conf.insecure "$@"
+      }
+
+      awx_cmd login
+
+      INVENTORY_ID=$(awx_cmd inventories list \
+        --organization "$AWX_ORGANIZATION" \
+        --name "$AWX_INVENTORY" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$INVENTORY_ID" ]; then
+        echo "AWX inventory not found: $AWX_INVENTORY. Nothing to clean up."
+        exit 0
+      fi
+
+      HOST_ID=$(awx_cmd hosts list \
+        --inventory "$INVENTORY_ID" \
+        --name "$HOSTNAME" \
+        -f json | jq -r '.results[0].id // empty')
+
+      if [ -z "$HOST_ID" ]; then
+        echo "AWX host not found: $HOSTNAME. Nothing to clean up."
+      else
+        echo "Deleting AWX host: $HOSTNAME"
+        awx_cmd hosts delete "$HOST_ID"
+      fi
+
+      if [ -n "$AWX_GROUP" ] && [ "$AWX_DELETE_EMPTY_GROUP" = "true" ]; then
+        GROUP_ID=$(awx_cmd groups list \
+          --inventory "$INVENTORY_ID" \
+          --name "$AWX_GROUP" \
+          -f json | jq -r '.results[0].id // empty')
+
+        if [ -n "$GROUP_ID" ]; then
+          REMAINING_GROUP_HOSTS=$(curl --fail-with-body --silent --show-error \
+            --user "$AWX_USERNAME:$AWX_PASSWORD" \
+            "${AWX_HOST%/}/api/v2/groups/${GROUP_ID}/hosts/" | jq -r '.count')
+
+          if [ "$REMAINING_GROUP_HOSTS" = "0" ]; then
+            echo "Deleting empty AWX group: $AWX_GROUP"
+            awx_cmd groups delete "$GROUP_ID"
+          else
+            echo "AWX group $AWX_GROUP still has $REMAINING_GROUP_HOSTS host(s); keeping group."
+          fi
+        fi
+      fi
+
+      if [ "$AWX_DELETE_INVENTORY" = "true" ]; then
+        REMAINING_INVENTORY_HOSTS=$(curl --fail-with-body --silent --show-error \
+          --user "$AWX_USERNAME:$AWX_PASSWORD" \
+          "${AWX_HOST%/}/api/v2/inventories/${INVENTORY_ID}/hosts/" | jq -r '.count')
+
+        if [ "$REMAINING_INVENTORY_HOSTS" = "0" ]; then
+          echo "Deleting empty AWX inventory: $AWX_INVENTORY"
+          awx_cmd inventories delete "$INVENTORY_ID"
+        else
+          echo "AWX inventory $AWX_INVENTORY still has $REMAINING_INVENTORY_HOSTS host(s); keeping inventory."
+        fi
       fi
 
 ############################################
